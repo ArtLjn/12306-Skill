@@ -2,8 +2,6 @@
   <img src="docs/banner.png" alt="12306 查票 Skill" width="100%">
 </p>
 
-<h1 align="center">12306 查票 Skill</h1>
-
 <p align="center">
   <strong>智能火车票查询助手</strong> — 直达票 & 中转票，实时余票，零外部依赖
 </p>
