@@ -17,7 +17,13 @@ triggers:
   - 直达
   - 中转
   - 换乘
-description: 12306 火车票查询助手，支持直达票和中转票查询，包含余票、时刻、席别信息
+  - 智能查询
+  - 推荐方案
+  - 最优方案
+  - 多买几站
+  - 补票
+  - 怎么买票最划算
+description: 12306 火车票查询助手，支持直达票、中转票查询和智能推荐（含多买几站、先上车后补票策略），包含余票、时刻、席别、票价信息
 tools:
   - train_store
 ---
@@ -54,6 +60,18 @@ tools:
 - 参数同 query，额外支持可选的 `middle_station` 指定中转站
 - 不传 `middle_station` 时系统自动推荐中转方案
 
+### smart_query — 智能综合查询
+
+```json
+{"action": "smart_query", "date": "明天", "from_station": "北京", "to_station": "上海"}
+```
+```json
+{"action": "smart_query", "date": "5月1号", "from_station": "睢宁", "to_station": "苏州", "max_alt_stations": 3}
+```
+- 综合直达、中转、多买几站、先上车后补票四种策略，按时长/类型/便利度/成本/席别五维评分排序
+- `max_alt_stations` 可选，多买/少买最多查几站（默认 3）
+- `train_type` 可选，车次类型过滤
+
 ## 意图 → 参数映射
 
 | 用户说 | action | 参数 |
@@ -63,12 +81,16 @@ tools:
 | 后天北京到苏州北怎么走 | transfer_query | {date: "后天", from_station: "北京", to_station: "苏州北"} |
 | 有没有经过徐州中转的方案 | transfer_query | {date: "...", from_station: "...", to_station: "...", middle_station: "徐州"} |
 | 查火车票/查高铁 | query | 根据上下文提取 from/to/date |
+| 帮我查明天北京到上海怎么走最好 | smart_query | {date: "明天", from_station: "北京", to_station: "上海"} |
+| 有没有什么方案到苏州 | smart_query | 直达售罄时自动尝试中转/多买/补票 |
+| 多买几站试试 / 补票也行 | smart_query | {date: "...", from_station: "...", to_station: "..."} |
 
 ## 关键语义区分规则
 
 - 用户只说"查票"没有具体站名 → 追问出发站和到达站
 - "直达" → action=query（查直达票）
 - "中转/换乘/转车/怎么走" → action=transfer_query
+- "怎么走最好/推荐方案/最优/多买几站/补票" → action=smart_query
 - "高铁/动车" → action=query + train_type 过滤
 - 日期提取：识别"明天"、"后天"、"X月X号"、"X月X日"、"XXXX年X月X日"
 - 站名映射：模糊匹配（"北京"匹配"北京"/"北京南"/"北京西"等）

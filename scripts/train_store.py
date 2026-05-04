@@ -1,11 +1,12 @@
 """12306 查票工具组 — train_store（自包含，零外部依赖）。
 
-提供 2 个工具函数：
+提供 3 个工具函数：
   train_query            — 直达票查询
   train_transfer_query   — 中转票查询
+  train_smart_query      — 智能综合查询（直达+中转+多买几站+补票+评分）
 
 通过 ToolRegistry 动态加载，供主 Agent dispatch 调用。
-所有辅助逻辑（车站查询、API 客户端）内联于此文件，无需额外模块。
+所有辅助逻辑（车站查询、API 客户端、价格解析、评分）内联于此文件，无需额外模块。
 """
 
 from __future__ import annotations
@@ -29,10 +30,9 @@ logger = logging.getLogger(__name__)
 ToolExecutor = Callable[[dict], Coroutine[Any, Any, str]]
 
 __all__ = ["DEFINITIONS", "EXECUTORS", "DISPATCH"]
-
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 # 车站电报码查询（原 _station.py）
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 
 _STATION_URL = "https://kyfw.12306.cn/otn/resources/js/framework/station_name.js"
 _CACHE_FILE = Path(__file__).parent.parent / "data" / "station_cache.json"
@@ -40,14 +40,12 @@ _CACHE_FILE = Path(__file__).parent.parent / "data" / "station_cache.json"
 _station_map: dict[str, str] | None = None
 _station_lock = threading.Lock()
 
-
 def _load_station_cache() -> dict[str, str]:
     """从本地 JSON 缓存加载站名映射。"""
     if _CACHE_FILE.exists():
         with open(_CACHE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
-
 
 def _fetch_station_online() -> dict[str, str]:
     """从 12306 在线拉取站名映射并更新本地缓存。"""
@@ -75,7 +73,6 @@ def _fetch_station_online() -> dict[str, str]:
         logger.warning("拉取车站数据失败: %s", e)
         return {}
 
-
 def _get_station_code(name: str) -> str | None:
     """获取车站电报码，缓存未命中时尝试在线刷新（线程安全）。"""
     global _station_map
@@ -92,25 +89,14 @@ def _get_station_code(name: str) -> str | None:
             _station_map.update(online)
         return _station_map.get(name)
     return None
-
-
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 # 12306 API 客户端（原 _api.py）
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 
 _USER_AGENTS = [
-    (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
-    ),
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.2",
 ]
 
 _DIRECT_URL = "https://kyfw.12306.cn/otn/leftTicket/query"
@@ -134,6 +120,8 @@ _FIELD_IDX = {
     "start_time": 8,
     "arrive_time": 9,
     "lishi": 10,
+    "from_station_no": 16,
+    "to_station_no": 17,
     "gr_num": 21,
     "rw_num": 23,
     "tz_num": 25,
@@ -142,6 +130,7 @@ _FIELD_IDX = {
     "ze_num": 30,
     "zy_num": 31,
     "swz_num": 32,
+    "yp_info_new": 39,
 }
 
 # 席别 key → 中文名
@@ -156,6 +145,22 @@ _SEAT_NAMES: dict[str, str] = {
     "gr_num": "高级软卧",
 }
 
+# 席别代码 → 中文名（用于价格解码）
+_SEAT_CODE_NAME: dict[str, str] = {
+    "9": "商务座", "P": "特等座", "M": "一等座", "O": "二等座",
+    "6": "高级软卧", "4": "软卧", "F": "动卧", "3": "硬卧",
+    "1": "硬座", "A": "高级动卧", "7": "一等座", "8": "二等座",
+}
+
+# 席别字段 key → 可能的代码列表（用于字段名→票价映射）
+_SEAT_KEY_CODES: dict[str, list[str]] = {
+    "swz_num": ["9", "A", "P"],
+    "zy_num": ["M", "7"],
+    "ze_num": ["O", "8"],
+    "rw_num": ["4", "6", "F"],
+    "yw_num": ["3"],
+}
+
 # 车次代号前缀 → 类型
 _TRAIN_TYPE_MAP: list[tuple[str, str]] = [
     ("G", "高铁"),
@@ -166,11 +171,9 @@ _TRAIN_TYPE_MAP: list[tuple[str, str]] = [
     ("K", "快速"),
 ]
 
-
 def _random_ua() -> str:
     """随机选一个 User-Agent。"""
     return random.choice(_USER_AGENTS)
-
 
 def _http_get(url: str, timeout: int = 15) -> str:
     """发起 GET 请求，返回响应文本（自动处理 UTF-8 BOM）。"""
@@ -178,14 +181,12 @@ def _http_get(url: str, timeout: int = 15) -> str:
     with urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
         return resp.read().decode("utf-8-sig")
 
-
 def _classify_train(code: str) -> str:
     """根据车次代号判断类型。"""
     for prefix, label in _TRAIN_TYPE_MAP:
         if code.startswith(prefix):
             return label
     return "其他"
-
 
 def _parse_seats(parts: list[str]) -> dict[str, str]:
     """从 pipe-separated 字段中提取有余票的席别。"""
@@ -197,12 +198,52 @@ def _parse_seats(parts: list[str]) -> dict[str, str]:
             seats[name] = val
     return seats
 
+def _decode_yp_info(yp_info: str) -> dict[str, float]:
+    """解码 yp_info_new 字段，提取各席别票价。
 
-# ── Cookie 管理（线程安全）───────────────────────────────────────
+    每组 10 字符：[0]席别代码 [1:6]票价÷10 [6:10]余票数。
+    """
+    prices: dict[str, float] = {}
+    for i in range(0, len(yp_info), 10):
+        group = yp_info[i : i + 10]
+        if len(group) < 10:
+            break
+        seat_code = group[0]
+        try:
+            prices[seat_code] = int(group[1:6]) / 10.0
+        except ValueError:
+            continue
+    return prices
+
+def _get_min_price(ticket: dict) -> float:
+    """从解析后的直达票 dict 中获取关注席别的最低票价。"""
+    prices = ticket.get("prices", {})
+    if not prices:
+        return 0.0
+    for key, codes in _SEAT_KEY_CODES.items():
+        seat_name = _SEAT_NAMES.get(key, "")
+        if seat_name and seat_name in ticket.get("seats", {}):
+            for code in codes:
+                p = prices.get(code, 0)
+                if p > 0:
+                    return p
+    valid = [p for p in prices.values() if p > 0]
+    return min(valid) if valid else 0.0
+
+def _lishi_to_minutes(lishi: str) -> int:
+    """将历时字符串（如 '05:30'）转为分钟数。"""
+    if not lishi or ":" not in lishi:
+        return 0
+    parts = lishi.split(":")
+    try:
+        return int(parts[0]) * 60 + int(parts[1])
+    except (ValueError, IndexError):
+        return 0
+
+# Cookie 管理（线程安全）
 
 _direct_cookies: dict[str, str] = {}
 _direct_cookie_lock = threading.Lock()
-
 
 def _init_direct_cookies() -> None:
     """访问余票查询首页获取必要 Cookie。"""
@@ -221,9 +262,7 @@ def _init_direct_cookies() -> None:
     except (URLError, OSError) as e:
         logger.warning("获取直达查询Cookie失败: %s", e)
 
-
-# ── 直达票查询 ────────────────────────────────────────────────
-
+# 直达票查询
 
 def _query_direct(
     train_date: str,
@@ -281,7 +320,6 @@ def _query_direct(
 
     return []
 
-
 def _parse_direct_item(raw: str) -> dict[str, Any]:
     """解析单条直达票记录。"""
     parts = raw.split("|")
@@ -293,14 +331,71 @@ def _parse_direct_item(raw: str) -> dict[str, Any]:
     result["train_type"] = _classify_train(code)
     result["seats"] = _parse_seats(parts)
     result["has_ticket"] = bool(result["seats"])
+
+    # 票价解码
+    yp_info = result.pop("yp_info_new", "")
+    result["prices"] = _decode_yp_info(yp_info) if yp_info else {}
     return result
 
+# 经停站查询
 
-# ── 中转票查询 ────────────────────────────────────────────────
+_ROUTE_URL = "https://kyfw.12306.cn/otn/czxx/queryByTrainNo"
+
+def _query_route_stops(
+    train_no: str,
+    from_code: str,
+    to_code: str,
+    train_date: str,
+) -> list[dict[str, Any]]:
+    """查询列车经停站列表，复用直达查询 Cookie。"""
+    params = {
+        "train_no": train_no,
+        "from_station_telecode": from_code,
+        "to_station_telecode": to_code,
+        "depart_date": train_date,
+    }
+    url = f"{_ROUTE_URL}?{urlencode(params)}"
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            req = Request(url, headers={"User-Agent": _random_ua()})
+            with _direct_cookie_lock:
+                if _direct_cookies:
+                    req.add_header(
+                        "Cookie",
+                        "; ".join(f"{k}={v}" for k, v in _direct_cookies.items()),
+                    )
+            with urlopen(req, timeout=15, context=_SSL_CTX) as resp:
+                body = json.loads(resp.read().decode("utf-8-sig"))
+            if body.get("status") and isinstance(body.get("data"), dict):
+                return body["data"].get("data", [])
+            return []
+        except (URLError, OSError, ValueError) as e:
+            logger.warning("经停站查询失败 (第%d次): %s", attempt, e)
+            if attempt < _MAX_RETRIES:
+                time.sleep(random.uniform(1, 2))
+    return []
+
+def _find_stations_after(stops: list[dict], name: str, n: int = 3) -> list[dict]:
+    """找到目标站之后的 n 个经停站（多买几站用）。"""
+    for i, s in enumerate(stops):
+        if s.get("station_name") == name:
+            return stops[i + 1 : i + 1 + n]
+    return []
+
+def _find_stations_before(stops: list[dict], name: str, n: int = 3) -> list[dict]:
+    """找到目标站之前的 n 个经停站，按离目标站从近到远排列（补票用）。"""
+    for i, s in enumerate(stops):
+        if s.get("station_name") == name:
+            before = stops[max(0, i - n) : i]
+            before.reverse()
+            return before
+    return []
+
+# 中转票查询
 
 _transfer_cookies: dict[str, str] = {}
 _transfer_cookie_lock = threading.Lock()
-
 
 def _http_get_transfer(url: str, timeout: int = 15) -> str:
     """带 Cookie 的 GET 请求，自动保存和发送 Cookie（线程安全）。"""
@@ -319,7 +414,6 @@ def _http_get_transfer(url: str, timeout: int = 15) -> str:
                 with _transfer_cookie_lock:
                     _transfer_cookies[k.strip()] = v.strip()
         return resp.read().decode("utf-8")
-
 
 def _query_transfer(
     train_date: str,
@@ -359,16 +453,13 @@ def _query_transfer(
         try:
             text = _http_get_transfer(url)
             body = json.loads(text)
-
             if not body.get("status"):
                 logger.warning("中转查询返回错误")
                 return []
-
             data = body.get("data")
             if not isinstance(data, dict):
                 return []
             return data.get("middleList", [])
-
         except (URLError, OSError) as e:
             logger.warning("中转查询失败 (第%d次): %s", attempt, e)
             if attempt < _MAX_RETRIES:
@@ -377,11 +468,9 @@ def _query_transfer(
                     _transfer_cookies = {}
                 try:
                     init_text = _http_get_transfer(_TRANSFER_INIT)
-                    match = re.search(
-                        r"var\s+lc_search_url\s*=\s*'(.+?)'", init_text
-                    )
-                    if match:
-                        search_url = match.group(1)
+                    m = re.search(r"var\s+lc_search_url\s*=\s*'(.+?)'", init_text)
+                    if m:
+                        search_url = m.group(1)
                     url = f"{_TRANSFER_BASE}{search_url}?{urlencode(params)}"
                 except (URLError, OSError):
                     pass
@@ -390,12 +479,100 @@ def _query_transfer(
             return []
 
     return []
+# ════════════════════════════════════════
+# 智能评分 & 替代站查询
+# ════════════════════════════════════════
 
+# 评分权重（满分 100）
+_W_DUR, _W_TYPE, _W_CONV, _W_COST, _W_SEAT = 40, 30, 10, 10, 10
 
-# ═══════════════════════════════════════════════════════════════════
+def _score_plan(plan: dict, max_dur: int, max_price: float) -> float:
+    """综合评分：时长(40) + 类型(30) + 便利度(10) + 成本(10) + 席别(10)。"""
+    if max_dur <= 0:
+        max_dur = 1
+
+    # 时长分（线性衰减）
+    dur = _W_DUR * max(0, 1 - plan.get("duration_min", 0) / max_dur)
+
+    # 类型分
+    type_scores = {
+        "direct": _W_TYPE,
+        "buy_more": _W_TYPE * 0.83,
+        "short_buy": _W_TYPE * 0.75,
+        "transfer": _W_TYPE * 0.67,
+    }
+    typ = type_scores.get(plan.get("plan_type", ""), _W_TYPE * 0.5)
+
+    # 便利度分
+    extra = plan.get("extra_stations", 0)
+    pt = plan.get("plan_type", "")
+    conv = _W_CONV
+    if pt == "buy_more":
+        conv = max(0, _W_CONV - extra * 3)
+    elif pt == "short_buy":
+        conv = max(0, _W_CONV - extra * 2)
+
+    # 成本分（线性衰减）
+    p = plan.get("price", 0) or 0
+    cost = _W_COST * max(0, 1 - p / max_price) if max_price > 0 else _W_COST * 0.5
+
+    # 席别分
+    seat = _W_SEAT if plan.get("seats") else 0
+
+    return round(dur + typ + conv + cost + seat, 1)
+
+def _query_alt_station(
+    ticket: dict,
+    train_date: str,
+    from_code: str,
+    to_code: str,
+    to_name: str,
+    mode: str,
+    max_stations: int = 3,
+) -> list[dict]:
+    """查询多买几站或先上车后补票的替代方案。
+
+    mode: "buy_more" 查目的站之后的站，"short_buy" 查之前的站。
+    """
+    train_no = ticket.get("train_no", "")
+    code = ticket.get("station_train_code", "")
+
+    stops = _query_route_stops(train_no, from_code, to_code, train_date)
+    if not stops:
+        return []
+
+    if mode == "buy_more":
+        candidates = _find_stations_after(stops, to_name, max_stations)
+    else:
+        candidates = _find_stations_before(stops, to_name, max_stations)
+
+    results: list[dict] = []
+    for stop in candidates:
+        alt_name = stop.get("station_name", "")
+        alt_code = _get_station_code(alt_name)
+        if not alt_code:
+            continue
+
+        alt_tickets = _query_direct(train_date, from_code, alt_code)
+        for alt in alt_tickets:
+            if alt.get("station_train_code") == code and alt.get("has_ticket"):
+                extra = abs(
+                    int(ticket.get("to_station_no", "0") or "0")
+                    - int(alt.get("to_station_no", "0") or "0")
+                )
+                results.append(_make_plan(
+                    mode, code, ticket.get("start_time", ""),
+                    ticket.get("arrive_time", ""), ticket.get("lishi", ""),
+                    alt.get("seats", {}), alt.get("prices", {}),
+                    _get_min_price(alt), extra, alt_name, to_name,
+                ))
+                break  # 同车次取第一个有票的即可
+        time.sleep(1)
+
+    return results
+# ════════════════════════════════════════
 # 日期解析
-# ═══════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════
 
 def _resolve_date(date_str: str) -> str:
     """将自然语言日期转换为 YYYY-MM-DD 格式。
@@ -420,11 +597,9 @@ def _resolve_date(date_str: str) -> str:
         except ValueError:
             pass
     return date_str
-
-
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 # 工具定义（OpenAI Function Calling 格式）
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 
 DEFINITIONS: list[dict] = [
     {
@@ -438,24 +613,10 @@ DEFINITIONS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": (
-                            "出发日期，支持：YYYY-MM-DD、明天、后天、大后天、M月D日"
-                        ),
-                    },
-                    "from_station": {
-                        "type": "string",
-                        "description": "出发站名称，如'北京'、'上海虹桥'",
-                    },
-                    "to_station": {
-                        "type": "string",
-                        "description": "到达站名称，如'深圳北'、'成都东'",
-                    },
-                    "train_type": {
-                        "type": "string",
-                        "description": "车次类型过滤：高铁、动车、直达、特快、快速。不传不过滤",
-                    },
+                    "date": {"type": "string", "description": "出发日期"},
+                    "from_station": {"type": "string", "description": "出发站名称"},
+                    "to_station": {"type": "string", "description": "到达站名称"},
+                    "train_type": {"type": "string", "description": "车次类型过滤（可选）"},
                 },
                 "required": ["date", "from_station", "to_station"],
             },
@@ -472,34 +633,40 @@ DEFINITIONS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "date": {
-                        "type": "string",
-                        "description": "出发日期，支持：YYYY-MM-DD、明天、后天、大后天、M月D日",
-                    },
-                    "from_station": {
-                        "type": "string",
-                        "description": "出发站名称",
-                    },
-                    "to_station": {
-                        "type": "string",
-                        "description": "到达站名称",
-                    },
-                    "middle_station": {
-                        "type": "string",
-                        "description": "中转站名称，不传则自动推荐",
-                    },
+                    "date": {"type": "string", "description": "出发日期"},
+                    "from_station": {"type": "string", "description": "出发站名称"},
+                    "to_station": {"type": "string", "description": "到达站名称"},
+                    "middle_station": {"type": "string", "description": "中转站名称（可选）"},
+                },
+                "required": ["date", "from_station", "to_station"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "train_smart_query",
+            "description": (
+                "智能火车票查询。综合直达、中转、多买几站、先上车后补票四种策略，"
+                "按时长、类型、便利度、成本、席别综合评分，推荐最优方案。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "出发日期"},
+                    "from_station": {"type": "string", "description": "出发站名称"},
+                    "to_station": {"type": "string", "description": "到达站名称"},
+                    "train_type": {"type": "string", "description": "车次类型过滤（可选）"},
+                    "max_alt_stations": {"type": "integer", "description": "多买/少买最多查几站（默认3）"},
                 },
                 "required": ["date", "from_station", "to_station"],
             },
         },
     },
 ]
-
-
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 # Executor 实现
-# ═══════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════
 
 async def train_query(args: dict) -> str:
     """查询直达票。"""
@@ -520,26 +687,16 @@ async def train_query(args: dict) -> str:
         return json.dumps({"error": f"未找到车站: {to_name}"}, ensure_ascii=False)
 
     results = _query_direct(date_str, from_code, to_code)
-
     if train_type:
         results = [r for r in results if r.get("train_type") == train_type]
-
     has_ticket = [r for r in results if r.get("has_ticket")]
-    sold_out = [r for r in results if not r.get("has_ticket")]
 
-    return json.dumps(
-        {
-            "date": date_str,
-            "from": from_name,
-            "to": to_name,
-            "total": len(results),
-            "has_ticket_count": len(has_ticket),
-            "sold_out_count": len(sold_out),
-            "trains": has_ticket[:10],
-        },
-        ensure_ascii=False,
-    )
-
+    return json.dumps({
+        "date": date_str, "from": from_name, "to": to_name,
+        "total": len(results), "has_ticket_count": len(has_ticket),
+        "sold_out_count": len(results) - len(has_ticket),
+        "trains": has_ticket[:10],
+    }, ensure_ascii=False)
 
 async def train_transfer_query(args: dict) -> str:
     """查询中转票。"""
@@ -562,61 +719,149 @@ async def train_transfer_query(args: dict) -> str:
 
     raw = _query_transfer(date_str, from_code, to_code, middle_code)
 
+    def _seg_dict(seg: dict, prefix: str) -> dict:
+        return {
+            f"{prefix}_train": seg.get("station_train_code", ""),
+            f"{prefix}_from": seg.get("from_station_name", ""),
+            f"{prefix}_start": seg.get("start_time", ""),
+            f"{prefix}_to": seg.get("to_station_name", ""),
+            f"{prefix}_arrive": seg.get("arrive_time", ""),
+        }
+
     routes = []
     for item in raw[:5]:
         trains = item.get("fullList", [])
         if len(trains) < 2:
             continue
+        route = {
+            "middle": item.get("middle_station_name", ""),
+            "total_duration": item.get("all_lishi", ""),
+            "wait_time": item.get("wait_time", ""),
+        }
+        route.update(_seg_dict(trains[0], "first"))
+        route.update(_seg_dict(trains[1], "second"))
+        routes.append(route)
+
+    return json.dumps({
+        "date": date_str, "from": from_name, "to": to_name,
+        "total": len(raw), "routes": routes,
+    }, ensure_ascii=False)
+
+def _make_plan(
+    plan_type: str, code: str, start: str, arrive: str,
+    lishi: str, seats: dict, prices: dict, price: float,
+    extra: int = 0, buy_to: str = "", target: str = "",
+    **kw: Any,
+) -> dict:
+    """构造统一的方案 dict。"""
+    return {
+        "plan_type": plan_type,
+        "station_train_code": code,
+        "start_time": start,
+        "arrive_time": arrive,
+        "lishi": lishi,
+        "duration_min": _lishi_to_minutes(lishi),
+        "seats": seats,
+        "prices": prices,
+        "price": price,
+        "extra_stations": extra,
+        "buy_to_station": buy_to,
+        "target_station": target,
+        **kw,
+    }
+
+async def train_smart_query(args: dict) -> str:
+    """智能查询：综合直达+中转+多买几站+先上车后补票，评分排序推荐。"""
+    date_str = _resolve_date(args.get("date", ""))
+    from_name = args.get("from_station", "")
+    to_name = args.get("to_station", "")
+    train_type = args.get("train_type", "")
+    max_stations = int(args.get("max_alt_stations", 3))
+
+    if not date_str:
+        return json.dumps({"error": "请提供出发日期"}, ensure_ascii=False)
+
+    from_code = _get_station_code(from_name)
+    to_code = _get_station_code(to_name)
+    if not from_code:
+        return json.dumps({"error": f"未找到车站: {from_name}"}, ensure_ascii=False)
+    if not to_code:
+        return json.dumps({"error": f"未找到车站: {to_name}"}, ensure_ascii=False)
+
+    plans: list[dict] = []
+
+    # 1. 直达票
+    direct = _query_direct(date_str, from_code, to_code)
+    if train_type:
+        direct = [d for d in direct if d.get("train_type") == train_type]
+
+    for d in direct:
+        if d.get("has_ticket"):
+            plans.append(_make_plan(
+                "direct", d.get("station_train_code", ""),
+                d.get("start_time", ""), d.get("arrive_time", ""),
+                d.get("lishi", ""), d.get("seats", {}),
+                d.get("prices", {}), _get_min_price(d),
+                buy_to=to_name, target=to_name,
+            ))
+
+    # 2. 中转票
+    raw_transfers = _query_transfer(date_str, from_code, to_code)
+    for item in raw_transfers[:5]:
+        trains = item.get("fullList", [])
+        if len(trains) < 2:
+            continue
         first, second = trains[0], trains[1]
-        routes.append(
-            {
-                "middle": item.get("middle_station_name", ""),
-                "total_duration": item.get("all_lishi", ""),
-                "wait_time": item.get("wait_time", ""),
-                "first_train": first.get("station_train_code", ""),
-                "first_from": first.get("from_station_name", ""),
-                "first_start": first.get("start_time", ""),
-                "first_to": first.get("to_station_name", ""),
-                "first_arrive": first.get("arrive_time", ""),
-                "second_train": second.get("station_train_code", ""),
-                "second_from": second.get("from_station_name", ""),
-                "second_start": second.get("start_time", ""),
-                "second_to": second.get("to_station_name", ""),
-                "second_arrive": second.get("arrive_time", ""),
-            }
-        )
+        plans.append(_make_plan(
+            "transfer",
+            f"{first.get('station_train_code', '')}+{second.get('station_train_code', '')}",
+            first.get("start_time", ""), second.get("arrive_time", ""),
+            item.get("all_lishi", ""), {}, 0, 0,
+            middle_station=item.get("middle_station_name", ""),
+            wait_time=item.get("wait_time", ""),
+            buy_to=to_name, target=to_name,
+        ))
 
-    return json.dumps(
-        {
-            "date": date_str,
-            "from": from_name,
-            "to": to_name,
-            "total": len(raw),
-            "routes": routes,
-        },
-        ensure_ascii=False,
-    )
+    # 3. 对售罄车次尝试多买几站和先上车后补票
+    sold_out = [d for d in direct if not d.get("has_ticket")]
+    for ticket in sold_out[:5]:
+        for mode in ("buy_more", "short_buy"):
+            plans.extend(_query_alt_station(
+                ticket, date_str, from_code, to_code, to_name, mode, max_stations,
+            ))
 
+    # 4. 评分排序
+    durations = [p["duration_min"] for p in plans if p["duration_min"] > 0]
+    max_dur = max(durations) if durations else 1
+    prices = [p["price"] for p in plans if p.get("price", 0) > 0]
+    max_price = max(prices) if prices else 0
 
-# ═══════════════════════════════════════════════════════════════════
+    for p in plans:
+        p["score"] = _score_plan(p, max_dur, max_price)
+    plans.sort(key=lambda p: p["score"], reverse=True)
+
+    return json.dumps({
+        "date": date_str, "from": from_name, "to": to_name,
+        "total": len(plans), "plans": plans[:10],
+    }, ensure_ascii=False)
+# ════════════════════════════════════════
 # Executor 注册表
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 
 EXECUTORS: dict[str, ToolExecutor] = {
     "train_query": train_query,
     "train_transfer_query": train_transfer_query,
+    "train_smart_query": train_smart_query,
 }
-
-
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 # Dispatch
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 
 _ACTION_TO_TOOL: dict[str, str] = {
     "query": "train_query",
     "transfer_query": "train_transfer_query",
+    "smart_query": "train_smart_query",
 }
-
 
 async def train_dispatch(
     params: dict,
@@ -646,7 +891,6 @@ async def train_dispatch(
         "status": "failed" if is_failed else "success",
     }
 
-
 def _format_reply(action: str, result: dict, is_failed: bool) -> str:
     """根据 action 类型格式化语音播报友好回复。"""
     if is_failed:
@@ -656,24 +900,20 @@ def _format_reply(action: str, result: dict, is_failed: bool) -> str:
         return formatter(result)
     return str(result)
 
-
-# ── 回复格式化策略 ──────────────────────────────────────────
-
+# 回复格式化策略
 
 def _format_query(r: dict) -> str:
     """直达票查询回复。"""
     total = r.get("total", 0)
-    has_count = r.get("has_ticket_count", 0)
-    sold_count = r.get("sold_out_count", 0)
     trains = r.get("trains", [])
-    from_name = r.get("from", "")
-    to_name = r.get("to", "")
-    d = r.get("date", "")
+    d, fr, to = r.get("date", ""), r.get("from", ""), r.get("to", "")
 
     if total == 0:
-        return f"{d} {from_name}到{to_name}没有直达车次，要不要帮您查一下中转方案？"
+        return f"{d} {fr}到{to}没有直达车次，要不要帮您查一下中转方案？"
 
-    parts = [f"{d} {from_name}到{to_name}共{total}趟直达车次"]
+    has_count = r.get("has_ticket_count", 0)
+    sold_count = r.get("sold_out_count", 0)
+    parts = [f"{d} {fr}到{to}共{total}趟直达车次"]
     if sold_count > 0:
         parts.append(f"其中{has_count}趟有票，{sold_count}趟已售罄")
     else:
@@ -682,16 +922,13 @@ def _format_query(r: dict) -> str:
     if trains:
         parts.append("有票车次：")
         for t in trains[:5]:
-            code = t.get("station_train_code", "")
-            start = t.get("start_time", "")
-            arrive = t.get("arrive_time", "")
-            duration = t.get("lishi", "")
-            seats = t.get("seats", {})
-            seat_str = "、".join(f"{k}{v}" for k, v in seats.items())
-            parts.append(f"{code} {start}发车{arrive}到，历时{duration}，{seat_str}")
+            seat_str = "、".join(f"{k}{v}" for k, v in t.get("seats", {}).items())
+            parts.append(
+                f"{t.get('station_train_code', '')} {t.get('start_time', '')}发车"
+                f"{t.get('arrive_time', '')}到，历时{t.get('lishi', '')}，{seat_str}"
+            )
 
     return "。".join(parts)
-
 
 def _format_transfer(r: dict) -> str:
     """中转票查询回复。"""
@@ -711,28 +948,48 @@ def _format_transfer(r: dict) -> str:
 
     for i, route in enumerate(routes, 1):
         mid = route.get("middle", "")
-        dur = route.get("total_duration", "")
-        wait = route.get("wait_time", "")
-        f1 = route.get("first_train", "")
-        f1s = route.get("first_start", "")
-        f1a = route.get("first_arrive", "")
-        f2 = route.get("second_train", "")
-        f2s = route.get("second_start", "")
-        f2a = route.get("second_arrive", "")
-
+        f1, f1s, f1a = route.get("first_train", ""), route.get("first_start", ""), route.get("first_arrive", "")
+        f2, f2s, f2a = route.get("second_train", ""), route.get("second_start", ""), route.get("second_arrive", "")
         parts.append(
-            f"方案{i}，经{mid}中转，总耗时{dur}，等待{wait}。"
+            f"方案{i}，经{mid}中转，总耗时{route.get('total_duration', '')}，"
+            f"等待{route.get('wait_time', '')}。"
             f"第一程{f1}，{f1s}出发，{f1a}到{mid}。"
             f"第二程{f2}，{f2s}从{mid}出发，{f2a}到达"
         )
 
     return "。".join(parts)
 
+def _format_smart(r: dict) -> str:
+    """智能查询回复（语音播报友好格式）。"""
+    plans = r.get("plans", [])
+    d, fr, to = r.get("date", ""), r.get("from", ""), r.get("to", "")
+    if not plans:
+        return f"{d} {fr}到{to}没有找到任何方案"
+
+    type_labels = {"direct": "直达", "transfer": "中转", "buy_more": "多买几站", "short_buy": "先上车后补票"}
+    show = min(len(plans), 5)
+    parts = [f"{d} {fr}到{to}共找到{r.get('total', 0)}个方案，推荐前{show}个"]
+
+    for i, p in enumerate(plans[:5], 1):
+        label = type_labels.get(p.get("plan_type", ""), "")
+        seat_str = "、".join(f"{k}{v}" for k, v in p.get("seats", {}).items())
+        line = (
+            f"方案{i}（{label}，评分{p.get('score', 0)}）"
+            f"{p.get('station_train_code', '')} {p.get('start_time', '')}出发"
+            f"{p.get('arrive_time', '')}到，历时{p.get('lishi', '')}"
+        )
+        if seat_str:
+            line += f"，{seat_str}"
+        if p.get("buy_to_station") and p["buy_to_station"] != to:
+            line += f"，需买票到{p['buy_to_station']}"
+        parts.append(line)
+
+    return "。".join(parts)
 
 _REPLY_FORMATTERS: dict[str, Callable[[dict], str]] = {
     "query": _format_query,
     "transfer_query": _format_transfer,
+    "smart_query": _format_smart,
 }
-
 
 DISPATCH = train_dispatch
